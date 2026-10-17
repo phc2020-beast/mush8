@@ -1,0 +1,28 @@
+name: Compile Mush8 iOS IPA
+on:
+  workflow_dispatch: # Allows you to start the compiler manually with a button click
+
+jobs:
+  build-ios:
+    runs-on: macos-14 # This spins up an Apple Silicon virtual machine in the cloud
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Development Dependencies
+        run: |
+          brew install cmake xcodegen
+          rustup toolchain install 1.98.1
+          rustup target add aarch64-apple-ios --toolchain 1.98.1
+          rustup default 1.98.1
+
+      - name: Execute Manual iOS Compile Matrix
+        run: |
+          chmod +x ./make-ios.sh
+          ./make-ios.sh --ipa
+
+      - name: Upload Completed IPA Archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mush8-iOS-IPA
+          path: build/Mush8.ipa
