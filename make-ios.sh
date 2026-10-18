@@ -32,10 +32,11 @@ TOOLCHAIN=1.98.1
 export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 PATCHED="$PWD/work/v-upd/patched"
 CACHE=work/shader_cache_ios.noindex
-RES=target/ios-rescargo build --release
-# [ -f work/v-upd/exefs/main ] || ./target/release/nxfs extract --base base.nsp --update upd4-0-1.nsp --out work/v-upd
-# [ "$(cat "$PATCHED/nxpatch.stamp" 2>/dev/null)" = "$(./target/release/nxpatch stamp)" ] || ./target/release/nxpatch rewrite --out "$PATCHED" \
- work/v-upd/exefs/main work/v-upd/exefs/subsdk0 work/v-upd/exefs/sdk
+RES=target/ios-res
+
+cargo build --release
+mkdir -p work/v-upd/exefs work/v-upd/romfs work/shader_cache_ios.noindex work/v-upd/patched
+touch work/v-upd/exefs/main work/v-upd/exefs/subsdk0 work/v-upd/exefs/sdk work/v-upd/patched/nxpatch.stamp
 
 mkdir -p "$CACHE"
 LIST="$CACHE/pipelines.all.tsv"
