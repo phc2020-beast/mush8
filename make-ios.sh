@@ -35,6 +35,13 @@ TOOLCHAIN=1.98.1
 export PATH="/opt/homebrew/opt/rustup/bin:/usr/local/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
 # cross-compile overrides from the shell break the Mac-side tools (unicorn: -mcx16, __int64_t)
 unset SDKROOT BINDGEN_EXTRA_CLANG_ARGS CARGO_BUILD_TARGET CC CXX CFLAGS CXXFLAGS LDFLAGS
+# unicorn's configure only checks that pkg-config exists (Homebrew no longer installs on Intel)
+if ! command -v pkg-config >/dev/null; then
+  mkdir -p work/bin
+  printf '#!/bin/sh\n[ "$1" = --version ] && { echo 0.29.2; exit 0; }\nexit 1\n' > work/bin/pkg-config
+  chmod +x work/bin/pkg-config
+  export PATH="$PWD/work/bin:$PATH"
+fi
 # Intel Macs can't build or run the Mac nxhost (arm64 only): the game code is still
 # prepared here, but shaders are left for the device to compile the first time they're used
 INTEL=0
