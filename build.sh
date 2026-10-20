@@ -99,7 +99,6 @@ remember() {
 }
 
 [ "$(uname -s)" = Darwin ] || fail "Mush8 builds on macOS only."
-[ "$(uname -m)" = arm64 ] || fail "Mush8 needs an Apple Silicon Mac (M1 or newer)."
 
 bold "Checking Xcode"
 if ! xcodebuild -version >/dev/null 2>&1; then
@@ -118,11 +117,16 @@ xcodebuild -version | head -1
 
 pick "What do you want to build?" "Mush8 for this Mac" "Mush8 for iPhone / iPad"
 PLATFORM="$REPLY"
+if [ "$PLATFORM" = 1 ] && [ "$(uname -m)" != arm64 ]; then
+  fail "The Mac version needs an Apple Silicon Mac (M1 or newer). On an Intel Mac, choose iPhone / iPad instead."
+fi
 
 bold "Checking Homebrew"
 if ! command -v brew >/dev/null; then
-  [ -x /opt/homebrew/bin/brew ] || /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-  eval "$(/opt/homebrew/bin/brew shellenv)"
+  BREW=/opt/homebrew/bin/brew
+  [ "$(uname -m)" = arm64 ] || BREW=/usr/local/bin/brew
+  [ -x "$BREW" ] || /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+  eval "$("$BREW" shellenv)"
 fi
 brew --version | head -1
 if [ "$PLATFORM" = 2 ]; then
@@ -130,7 +134,7 @@ if [ "$PLATFORM" = 2 ]; then
 fi
 
 bold "Checking Rust"
-export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
+export PATH="/opt/homebrew/opt/rustup/bin:/usr/local/opt/rustup/bin:$HOME/.cargo/bin:$PATH"
 if ! command -v rustup >/dev/null; then
   brew install rustup
   hash -r
