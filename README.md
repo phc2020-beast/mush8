@@ -26,6 +26,7 @@ Mush8 will then asks for them : on macOS pick the folder holding them in the lau
 For iOS, also :
 - `rustup` with `rustup toolchain install 1.98.1` and `rustup target add aarch64-apple-ios --toolchain 1.98.1`
 - `xcodegen` (`brew install xcodegen`)
+- an Intel Mac works for the iOS build (not the Mac one) : it skips the shader precompile, so the device compiles each shader the first time it's used (expect stutter on the first races)
 - an Apple ID to sign the app on iOS (a free one works), or AltStore / SideStore to install the `.ipa`
 - a device on iOS/macOS 26 or later, with 6 GB of RAM or more (8 GB is comfy)
 
