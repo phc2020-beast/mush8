@@ -3,6 +3,9 @@
 # Constantin Clerc (c22dev) - 0.1
 set -eu
 cd "$(dirname "$0")"
+case "$PWD" in
+  *" "*|*:*) echo "move this folder to a path without spaces or colons (unicorn can't build there): $PWD"; exit 1 ;;
+esac
 
 MODE=""
 DEVICE=""
