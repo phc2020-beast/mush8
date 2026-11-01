@@ -1,8 +1,12 @@
 // Mush8 - lib.rs
 // Constantin Clerc (c22dev) - 0.1
+pub mod bflan;
+pub mod bflyt;
+pub mod bntx;
 pub mod crypto;
 pub mod keys;
 pub mod module;
+pub mod msbt;
 pub mod nca;
 pub mod nso;
 pub mod pfs0;

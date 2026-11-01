@@ -35,12 +35,63 @@ fn scripted(player: usize) -> u64 {
             Some((t.parse().ok()?, names.iter().find(|(n, _)| n.eq_ignore_ascii_case(b))?.1, player))
         }).collect()
     });
-    static START: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
-    let t = START.elapsed().as_secs_f32();
+    let t = crate::gfx::clock();
     SCRIPT.iter().filter(|(at, _, p)| *p == player + 1 && t >= *at && t < at + 0.15).fold(0, |m, (_, b, _)| m | b)
 }
 
 pub const MAX_PLAYERS: usize = 8;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub enum PadDriver {
+    Apple,
+    Sdl,
+}
+
+impl PadDriver {
+    pub fn parse(v: Option<&str>) -> PadDriver {
+        if v == Some("sdl") { PadDriver::Sdl } else { PadDriver::Apple }
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn pad_driver() -> PadDriver {
+    static DRIVER: std::sync::LazyLock<PadDriver> = std::sync::LazyLock::new(|| {
+        if cfg!(target_os = "macos") { PadDriver::parse(std::env::var("NX_PAD_DRIVER").ok().as_deref()) } else { PadDriver::Apple }
+    });
+    *DRIVER
+}
+
+fn use_sdl() -> bool {
+    #[cfg(target_os = "macos")]
+    return pad_driver() == PadDriver::Sdl && crate::sdl::init();
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
+pub enum Ctl {
+    Apple(objc2::rc::Retained<GCController>),
+    #[cfg(target_os = "macos")]
+    Sdl(crate::sdl::Pad),
+}
+
+impl Ctl {
+    unsafe fn motion(&self) -> Option<Motion> {
+        match self {
+            Ctl::Apple(c) => unsafe { controller_motion(c) },
+            #[cfg(target_os = "macos")]
+            Ctl::Sdl(p) => p.motion(),
+        }
+    }
+
+    unsafe fn name(&self) -> String {
+        match self {
+            Ctl::Apple(c) => unsafe { c.vendorName() }.map_or("Controller".into(), |n| n.to_string()),
+            #[cfg(target_os = "macos")]
+            Ctl::Sdl(p) => p.name(),
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct Motion {
@@ -48,7 +99,7 @@ pub struct Motion {
     pub gyro: [f32; 3],
 }
 
-pub static MOTION: std::sync::Mutex<[Option<Motion>; MAX_PLAYERS]> = std::sync::Mutex::new([None; MAX_PLAYERS]);
+pub static MOTION: std::sync::Mutex<[Option<(Motion, bool)>; MAX_PLAYERS]> = std::sync::Mutex::new([None; MAX_PLAYERS]);
 
 fn motion_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| std::env::var("NX_MOTION").is_ok_and(|v| v == "1"));
@@ -138,56 +189,197 @@ pub fn screen_sample() -> Vec<(u32, f32, f32, u32)> {
     out
 }
 
-pub static SLOT_NAMES: std::sync::Mutex<[Option<String>; MAX_PLAYERS]> = std::sync::Mutex::new([const { None }; MAX_PLAYERS]);
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Kind {
+    Controller,
+    Keyboard,
+    Touch,
+    Iphone,
+    Browser,
+    Virtual,
+}
+
+pub static SLOT_NAMES: std::sync::Mutex<[Option<(Kind, String)>; MAX_PLAYERS]> = std::sync::Mutex::new([const { None }; MAX_PLAYERS]);
+static SWAPS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+pub fn swap(a: usize, b: usize) {
+    SWAPS.lock().unwrap().push((a, b));
+}
+
+static EXTRA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn add_native() {
+    EXTRA.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn remove_native() {
+    EXTRA.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn extra_native() -> bool {
+    EXTRA.load(std::sync::atomic::Ordering::Relaxed) && !crate::gfx::tv()
+}
+
+static NEXT_NATIVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+pub fn native_slot() -> Option<usize> {
+    Some(NEXT_NATIVE.load(std::sync::atomic::Ordering::Relaxed)).filter(|&i| i < MAX_PLAYERS)
+}
+pub static FILL_TO: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+const HOLD: std::time::Duration = std::time::Duration::from_secs(120);
+
+type Kept = [Option<(u64, std::time::Instant)>; MAX_PLAYERS];
+
+fn open(slots: &[Option<Ctl>; MAX_PLAYERS], phones: &[Option<u64>; MAX_PLAYERS]) -> [bool; MAX_PLAYERS] {
+    std::array::from_fn(|i| slots[i].is_none() && phones[i].is_none())
+}
+
+fn pick(open: [bool; MAX_PLAYERS], kept: &Kept, device: Option<u64>) -> Option<usize> {
+    let free = || (0..MAX_PLAYERS).filter(move |&i| open[i]);
+    let other = |i: usize| kept[i].is_some_and(|(k, _)| Some(k) != device);
+    let held = |i: usize| other(i) && kept[i].is_some_and(|(_, at)| at.elapsed() < HOLD);
+    let returning = device.is_some_and(|d| kept.iter().flatten().any(|&(k, _)| k == d));
+    let first = if returning {
+        free().find(|&i| !other(i))
+    } else if open.iter().all(|&o| o) {
+        free().next()
+    } else {
+        None
+    };
+    first.or_else(|| free().find(|&i| !held(i))).or_else(|| free().min_by_key(|&i| kept[i].map(|(_, at)| at)))
+}
 
 pub struct Pads {
-    slots: [Option<objc2::rc::Retained<GCController>>; MAX_PLAYERS],
-    phones: [Option<std::net::SocketAddr>; MAX_PLAYERS],
+    slots: [Option<Ctl>; MAX_PLAYERS],
+    phones: [Option<u64>; MAX_PLAYERS],
+    kept: Kept,
+    touch: Option<usize>,
+    home: usize,
+    shown: bool,
     extra: usize,
+    fill: usize,
     touch_init: bool,
+    idle: bool,
     phone: Phone,
+    #[cfg(target_os = "macos")]
+    sdl_failed: crate::sdl::OpenOnce,
 }
 
 impl Pads {
     pub fn new() -> Self {
         let extra = std::env::var("NX_EXTRA_PADS").ok().and_then(|v| v.parse().ok()).unwrap_or(0usize).min(MAX_PLAYERS - 1);
-        Self { slots: Default::default(), phones: Default::default(), extra, touch_init: false, phone: Default::default() }
+        Self {
+            slots: Default::default(),
+            phones: Default::default(),
+            kept: Default::default(),
+            touch: None,
+            home: 0,
+            shown: false,
+            extra,
+            fill: 0,
+            touch_init: false,
+            idle: false,
+            phone: Default::default(),
+            #[cfg(target_os = "macos")]
+            sdl_failed: Default::default(),
+        }
     }
 
     pub fn poll(&mut self) -> [Option<PadState>; MAX_PLAYERS] {
-        let had_pad = self.slots[0].is_some();
         let out = self.poll_pads();
-        if self.slots[0].is_some() != had_pad || !self.touch_init {
+        let show = self.touch.is_some() || self.native_home();
+        if show != self.shown || !self.touch_init {
             self.touch_init = true;
-            crate::gfx::set_touch_controls(self.slots[0].is_none());
+            self.shown = show;
+            crate::gfx::set_touch_controls(show);
+        }
+        let idle = extra_native() && self.touch.is_some() && crate::gfx::touch_idle();
+        if idle != self.idle {
+            self.idle = idle;
+            crate::gfx::set_touch_idle(idle);
         }
         out
     }
 
+    fn native_home(&self) -> bool {
+        self.slots[self.home].is_none()
+    }
+
+    fn open(&self) -> [bool; MAX_PLAYERS] {
+        let mut o = open(&self.slots, &self.phones);
+        if let Some(t) = self.touch {
+            o[t] = false;
+        }
+        o
+    }
+
+    unsafe fn number(&self, i: usize) {
+        match &self.slots[i] {
+            Some(Ctl::Apple(c)) => unsafe { c.setPlayerIndex(GCControllerPlayerIndex(if i < 4 { i as isize } else { -1 })) },
+            #[cfg(target_os = "macos")]
+            Some(Ctl::Sdl(p)) if i < 4 => p.set_player(i),
+            _ => {}
+        }
+        if let Some(d) = self.phones[i] {
+            crate::remote::set_player(d, i as u8 + 1);
+        }
+    }
+
+    unsafe fn apply_swaps(&mut self) -> bool {
+        let swaps = std::mem::take(&mut *SWAPS.lock().unwrap());
+        for &(a, b) in &swaps {
+            self.slots.swap(a, b);
+            self.phones.swap(a, b);
+            self.kept.swap(a, b);
+            if let Some(t) = &mut self.touch {
+                *t = if *t == a { b } else if *t == b { a } else { *t };
+            }
+            self.home = if self.home == a { b } else if self.home == b { a } else { self.home };
+            unsafe {
+                self.number(a);
+                self.number(b);
+            }
+            eprintln!("[input] players {} and {} swapped", a + 1, b + 1);
+        }
+        !swaps.is_empty()
+    }
+
     fn poll_pads(&mut self) -> [Option<PadState>; MAX_PLAYERS] {
         objc2::rc::autoreleasepool(|_| unsafe {
-            let connected: Vec<_> = GCController::controllers().iter().filter(|c| c.extendedGamepad().is_some()).collect();
-            let mut changed = false;
+            let sdl = use_sdl();
+            let connected: Vec<_> =
+                if sdl { Vec::new() } else { GCController::controllers().iter().filter(|c| c.extendedGamepad().is_some()).collect() };
+            #[cfg(target_os = "macos")]
+            let sdl_ids = if sdl { crate::sdl::connected() } else { Vec::new() };
+            #[cfg(target_os = "macos")]
+            self.sdl_failed.keep(&sdl_ids);
+            let mut changed = self.apply_swaps();
             for s in self.slots.iter_mut() {
-                if s.as_ref().is_some_and(|c| !connected.iter().any(|n| std::ptr::eq(&**n, &**c))) {
+                let gone = match s {
+                    Some(Ctl::Apple(c)) => !connected.iter().any(|n| std::ptr::eq(&**n, &**c)),
+                    #[cfg(target_os = "macos")]
+                    Some(Ctl::Sdl(p)) => !sdl_ids.contains(&p.id()),
+                    None => false,
+                };
+                if gone {
                     *s = None;
                     changed = true;
                 }
             }
             let phones = crate::remote::connected();
             for (i, s) in self.phones.iter_mut().enumerate() {
-                if s.is_some_and(|a| !phones.iter().any(|(p, _)| *p == a)) {
+                if s.is_some_and(|d| !phones.iter().any(|(p, _)| *p == d)) {
                     eprintln!("[input] iPhone controller left player {}", i + 1);
-                    *s = None;
+                    self.kept[i] = s.take().map(|d| (d, std::time::Instant::now()));
                     changed = true;
                 }
             }
-            let free = |slots: &[Option<_>; MAX_PLAYERS], phones: &[Option<_>; MAX_PLAYERS]| (0..MAX_PLAYERS).find(|&i| slots[i].is_none() && phones[i].is_none());
             for c in connected {
-                if self.slots.iter().flatten().any(|s| std::ptr::eq(&**s, &*c)) {
+                if self.slots.iter().flatten().any(|s| matches!(s, Ctl::Apple(s) if std::ptr::eq(&**s, &*c))) {
                     continue;
                 }
-                if let Some(i) = free(&self.slots, &self.phones) {
+                if let Some(i) = pick(self.open(), &self.kept, None) {
                     if i < 4 {
                         c.setPlayerIndex(GCControllerPlayerIndex(i as isize));
                     }
@@ -197,70 +389,144 @@ impl Pads {
                         }
                     }
                     eprintln!("[input] {} is player {}", c.vendorName().map_or("gamepad".into(), |n| n.to_string()), i + 1);
-                    self.slots[i] = Some(c);
+                    self.slots[i] = Some(Ctl::Apple(c));
+                    self.kept[i] = None;
                     changed = true;
                 }
             }
-            for &(addr, _) in &phones {
-                if self.phones.contains(&Some(addr)) {
+            #[cfg(target_os = "macos")]
+            for id in sdl_ids {
+                if self.slots.iter().flatten().any(|s| matches!(s, Ctl::Sdl(p) if p.id() == id)) {
                     continue;
                 }
-                let Some(i) = free(&self.slots, &self.phones) else {
-                    crate::remote::set_player(addr, 0);
-                    continue;
-                };
-                eprintln!("[input] iPhone controller is player {}", i + 1);
-                self.phones[i] = Some(addr);
-                crate::remote::set_player(addr, i as u8 + 1);
+                let Some(i) = pick(self.open(), &self.kept, None) else { break };
+                let Some(pad) = self.sdl_failed.open(id, || crate::sdl::Pad::open(id)) else { continue };
+                if i < 4 {
+                    pad.set_player(i);
+                }
+                if motion_enabled() {
+                    pad.enable_motion();
+                }
+                eprintln!("[input] {} is player {}", pad.name(), i + 1);
+                self.slots[i] = Some(Ctl::Sdl(pad));
+                self.kept[i] = None;
                 changed = true;
             }
+            for &(device, _) in &phones {
+                if self.phones.contains(&Some(device)) {
+                    continue;
+                }
+                let mut open = self.open();
+                if self.native_home() {
+                    open[self.home] = false;
+                }
+                let Some(i) = pick(open, &self.kept, Some(device)) else {
+                    crate::remote::set_player(device, 0);
+                    continue;
+                };
+                let back = self.kept[i].is_some_and(|(k, _)| k == device);
+                eprintln!("[input] iPhone controller is player {}{}", i + 1, if back { " again" } else { "" });
+                self.phones[i] = Some(device);
+                self.kept[i] = None;
+                for k in self.kept.iter_mut().filter(|k| k.is_some_and(|(d, _)| d == device)) {
+                    *k = None;
+                }
+                crate::remote::set_player(device, i as u8 + 1);
+                changed = true;
+            }
+            if self.home != 0 && self.slots[0].is_none() && self.phones[0].is_none() {
+                self.home = 0;
+                changed = true;
+            }
+            if self.touch.is_some_and(|t| t != self.home) && self.slots[self.home].is_none() && self.phones[self.home].is_none() {
+                EXTRA.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            let own = crate::gfx::tv() || EXTRA.load(std::sync::atomic::Ordering::Relaxed);
+            if !own && self.touch.take().is_some() {
+                changed = true;
+            } else if own && self.touch.is_none() {
+                self.touch = pick(self.open(), &self.kept, None);
+                if let Some(i) = self.touch {
+                    eprintln!("[input] {} player {}", if cfg!(target_os = "ios") { "touch controls are" } else { "keyboard is" }, i + 1);
+                    self.kept[i] = None;
+                    changed = true;
+                }
+            }
+            if let Some(t) = self.touch
+                && let Some(g) = (t + 1..MAX_PLAYERS).find(|&j| self.slots[j].is_some())
+            {
+                self.slots.swap(t, g);
+                self.touch = Some(g);
+                self.number(t);
+                eprintln!("[input] gamepad moves up to player {}, {} player {}", t + 1, if cfg!(target_os = "ios") { "touch controls are" } else { "keyboard is" }, g + 1);
+                changed = true;
+            }
+            let next = if own { None } else { pick(self.open(), &self.kept, None) };
+            NEXT_NATIVE.store(next.unwrap_or(usize::MAX), std::sync::atomic::Ordering::Relaxed);
+            let touch_slot = if own { self.touch } else { self.native_home().then_some(self.home) };
+            let key_slot = touch_slot.or(Some(0));
             if changed {
                 crate::haptics::set_controllers(&self.slots);
             }
+            let fill = FILL_TO.load(std::sync::atomic::Ordering::Relaxed);
+            changed |= std::mem::replace(&mut self.fill, fill) != fill;
             let mut out: [Option<PadState>; MAX_PLAYERS] = Default::default();
             let mut virtual_left = self.extra;
             let phone = &mut self.phone;
             for (i, slot) in self.slots.iter().enumerate() {
                 let mut acc = Acc { buttons: scripted(i), ..Default::default() };
-                if let Some(g) = slot.as_ref().and_then(|c| c.extendedGamepad()) {
-                    acc.gamepad(&g);
+                match slot {
+                    Some(Ctl::Apple(c)) => {
+                        if let Some(g) = c.extendedGamepad() {
+                            acc.gamepad(&g);
+                        }
+                    }
+                    #[cfg(target_os = "macos")]
+                    Some(Ctl::Sdl(p)) => acc.sdl(&p.read()),
+                    None => {}
                 }
                 let remote = self.phones[i].and_then(|a| phones.iter().find(|(p, _)| *p == a)).map(|(_, pad)| *pad);
                 if let Some(pad) = &remote {
                     acc.remote(pad);
                 }
-                if i == 0 {
+                if key_slot == Some(i) {
                     acc.keyboard();
-                    if slot.is_none() {
-                        acc.touch();
-                    }
                 }
-                let virtual_pad = i > 0 && slot.is_none() && virtual_left > 0;
-                if virtual_pad {
+                if touch_slot == Some(i) {
+                    acc.touch();
+                }
+                let touched = touch_slot == Some(i);
+                let filler = i > 0 && i < fill && slot.is_none() && remote.is_none() && !touched;
+                let virtual_pad = filler || (i > 0 && slot.is_none() && virtual_left > 0);
+                if virtual_pad && !filler {
                     virtual_left -= 1;
                 }
-                if i == 0 || slot.is_some() || remote.is_some() || virtual_pad {
+                if filler {
+                    out[i] = out[0];
+                } else if i == 0 || slot.is_some() || remote.is_some() || touched || virtual_pad {
                     out[i] = Some(acc.state());
                 }
                 let sample = if !motion_enabled() {
                     None
                 } else if let Some(c) = slot {
-                    controller_motion(c)
+                    c.motion().map(|m| (m, true))
                 } else if let Some(pad) = &remote {
-                    pad.motion
+                    pad.motion.map(|m| (m, false))
+                } else if touched {
+                    phone_sample(phone, 0).map(|m| (m, false))
                 } else {
-                    phone_sample(phone, i)
+                    None
                 };
                 MOTION.lock().unwrap()[i] = sample;
                 if !(changed || !self.touch_init) {
                     continue;
                 }
                 let name = match slot {
-                    Some(c) => Some(c.vendorName().map_or("Controller".into(), |n| n.to_string())),
-                    None if remote.is_some() => Some("iPhone".into()),
-                    None if i == 0 && cfg!(target_os = "ios") => Some("Touch controls".into()),
-                    None if i == 0 => Some("Keyboard".into()),
-                    None if virtual_pad => Some("Virtual controller".into()),
+                    Some(c) => Some((Kind::Controller, c.name())),
+                    None if remote.is_some() => Some(if self.phones[i].is_some_and(crate::remote::is_web) { (Kind::Browser, "Browser".into()) } else { (Kind::Iphone, "iPhone".into()) }),
+                    None if touched && cfg!(target_os = "ios") => Some((Kind::Touch, "Touch controls".into())),
+                    None if touched || key_slot == Some(i) => Some((Kind::Keyboard, "Keyboard".into())),
+                    None if virtual_pad => Some((Kind::Virtual, "Virtual controller".into())),
                     None => None,
                 };
                 SLOT_NAMES.lock().unwrap()[i] = name;
@@ -349,6 +615,15 @@ impl Acc {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn sdl(&mut self, r: &crate::sdl::Reading) {
+        self.buttons |= r.buttons;
+        self.lx += r.sticks[0];
+        self.ly += r.sticks[1];
+        self.rx += r.sticks[2];
+        self.ry += r.sticks[3];
+    }
+
     fn remote(&mut self, pad: &crate::remote::Pad) {
         self.buttons |= pad.buttons;
         self.lx += pad.sticks[0];
@@ -415,5 +690,78 @@ impl Acc {
             }
         }
         p
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pad_driver_parse() {
+        assert_eq!(PadDriver::parse(None), PadDriver::Apple);
+        assert_eq!(PadDriver::parse(Some("apple")), PadDriver::Apple);
+        assert_eq!(PadDriver::parse(Some("sdl")), PadDriver::Sdl);
+        assert_eq!(PadDriver::parse(Some("SDL")), PadDriver::Apple);
+        assert_eq!(PadDriver::parse(Some("")), PadDriver::Apple);
+    }
+
+    #[test]
+    fn returning_phones_get_their_slot_back() {
+        let now = std::time::Instant::now();
+        let mut kept: Kept = Default::default();
+        kept[0] = Some((7, now));
+        kept[1] = Some((9, now));
+        let mut open = [true; MAX_PLAYERS];
+        open[4] = false;
+        assert_eq!(pick(open, &kept, Some(9)), Some(1));
+        assert_eq!(pick(open, &kept, Some(7)), Some(0));
+        assert_eq!(pick(open, &kept, Some(5)), Some(2));
+        assert_eq!(pick(open, &kept, None), Some(2));
+    }
+
+    #[test]
+    fn newcomers_take_a_kept_slot_only_when_needed() {
+        let now = std::time::Instant::now();
+        let mut kept: Kept = Default::default();
+        let mut open = [false; MAX_PLAYERS];
+        open[1] = true;
+        open[3] = true;
+        kept[1] = Some((7, now));
+        kept[3] = Some((8, now.checked_sub(std::time::Duration::from_secs(5)).unwrap()));
+        assert_eq!(pick(open, &kept, None), Some(3));
+        kept[3] = None;
+        assert_eq!(pick(open, &kept, None), Some(3));
+        kept[1] = Some((7, now.checked_sub(HOLD * 2).unwrap()));
+        kept[3] = Some((8, now));
+        assert_eq!(pick(open, &kept, None), Some(1));
+        assert_eq!(pick(open, &kept, Some(8)), Some(3));
+        assert_eq!(pick([false; MAX_PLAYERS], &kept, Some(7)), None);
+    }
+
+    #[test]
+    fn returning_phones_fill_a_lower_empty_slot() {
+        let now = std::time::Instant::now();
+        let mut kept: Kept = Default::default();
+        let mut open = [true; MAX_PLAYERS];
+        open[0] = false;
+        kept[2] = Some((8, now));
+        assert_eq!(pick(open, &kept, Some(8)), Some(1));
+        kept[1] = Some((7, now.checked_sub(HOLD * 2).unwrap()));
+        assert_eq!(pick(open, &kept, Some(8)), Some(2));
+        assert_eq!(pick(open, &kept, Some(5)), Some(1));
+    }
+
+    #[test]
+    fn a_lone_controller_takes_the_first_slot() {
+        let now = std::time::Instant::now();
+        let mut kept: Kept = Default::default();
+        kept[0] = Some((7, now));
+        assert_eq!(pick([true; MAX_PLAYERS], &kept, Some(9)), Some(0));
+        assert_eq!(pick([true; MAX_PLAYERS], &kept, None), Some(0));
+        let mut open = [true; MAX_PLAYERS];
+        open[1] = false;
+        assert_eq!(pick(open, &kept, Some(9)), Some(2));
+        assert_eq!(pick(open, &kept, Some(7)), Some(0));
     }
 }

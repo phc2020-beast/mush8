@@ -47,7 +47,8 @@ fi
 INTEL=0
 [ "$(uname -m)" = arm64 ] || INTEL=1
 PATCHED="$PWD/work/v-upd/patched"
-CACHE=work/shader_cache_ios.noindex
+CACHE_ROOT=work/shader_cache_ios.noindex
+CACHE="$CACHE_ROOT/heap-segments-v2"
 RES=target/ios-res
 
 if [ "$INTEL" = 1 ]; then
@@ -55,21 +56,29 @@ if [ "$INTEL" = 1 ]; then
 else
   cargo build --release
 fi
-[ -f work/v-upd/exefs/main ] || ./target/release/nxfs extract --base base.nsp --update upd4-0-1.nsp --out work/v-upd
+UPDATE=update.nsp
+[ -e "$UPDATE" ] || [ ! -e upd4-0-1.nsp ] || UPDATE=upd4-0-1.nsp
+SOURCE="$(stat -L -f %z "$UPDATE" 2>/dev/null)"
+if [ "$(cat work/v-upd/source 2>/dev/null)" != "$SOURCE" ] || [ ! -f work/v-upd/exefs/main ]; then
+  rm -rf work/v-upd
+  mkdir -p work/v-upd
+  echo "$SOURCE" > work/v-upd/source
+  ./target/release/nxfs extract --base base.nsp --update "$UPDATE" --out work/v-upd
+fi
 [ "$(cat "$PATCHED/nxpatch.stamp" 2>/dev/null)" = "$(./target/release/nxpatch stamp)" ] || ./target/release/nxpatch rewrite --out "$PATCHED" \
   work/v-upd/exefs/main work/v-upd/exefs/subsdk0 work/v-upd/exefs/sdk
 
 mkdir -p "$CACHE"
 LIST="$CACHE/pipelines.all.tsv"
 cat data/pipelines.tsv work/pipelines.tsv 2>/dev/null | awk 'NF && !seen[$0]++' > "$LIST.new"
-STAMP="$(shasum "$LIST.new" | cut -d' ' -f1)"
+STAMP="$({ cat "$LIST.new"; echo "$SOURCE"; } | shasum | cut -d' ' -f1)"
 mv "$LIST.new" "$LIST"
 
 if [ "$INTEL" = 1 ]; then
   echo "Intel Mac: skipping iOS shader precompile, the game compiles shaders on the device as it needs them (expect stutter the first time)"
 elif [ "$SHADERS" = 1 ] || [ ! -f "$CACHE/index.tsv" ] || [ "$(cat "$CACHE/pipelines.stamp" 2>/dev/null)" != "$STAMP" ]; then
   echo "precompiling shaders for iOS (log: work/precompile_ios.log)…"
-  NX_SHADER_SDK=iphoneos NX_SHADER_CACHE="$CACHE" ./target/release/nxhost --precompile > work/precompile_ios.log 2>&1 \
+  NX_SHADER_SDK=iphoneos NX_SHADER_CACHE="$CACHE_ROOT" ./target/release/nxhost --update "$UPDATE" --precompile > work/precompile_ios.log 2>&1 \
     || { tail -20 work/precompile_ios.log; exit 1; }
   tail -3 work/precompile_ios.log
   echo "$STAMP" > "$CACHE/pipelines.stamp"
@@ -79,12 +88,12 @@ NX_MODULES_DIR="$PATCHED" IPHONEOS_DEPLOYMENT_TARGET=26.0 \
   cargo "+$TOOLCHAIN" build --release -p nxhost --target aarch64-apple-ios --target-dir target/ios
 
 rm -rf "$RES"
-mkdir -p "$RES/modules" "$RES/shaders"
+mkdir -p "$RES/modules" "$RES/shaders/heap-segments-v2"
 cp "$PATCHED"/*.layout work/v-upd/exefs/main.npdm "$RES/modules/"
 if [ "$INTEL" = 1 ]; then
-  touch "$RES/shaders/index.tsv" "$RES/shaders/guest.tsv"
+  touch "$RES/shaders/heap-segments-v2/index.tsv" "$RES/shaders/heap-segments-v2/guest.tsv"
 else
-  cp -c "$CACHE"/*.metallib "$CACHE"/index.tsv "$CACHE"/guest.tsv "$RES/shaders/"
+  cp -c "$CACHE"/*.metallib "$CACHE"/index.tsv "$CACHE"/guest.tsv "$RES/shaders/heap-segments-v2/"
 fi
 cp "$LIST" "$RES/shaders/pipelines.tsv"
 
@@ -123,5 +132,5 @@ if [ "$MODE" = "--install" ]; then
   fi
   [ -n "$DEVICE" ] || { echo "no iPhone / iPad connected (unlocked, Developer Mode on)"; exit 1; }
   xcrun devicectl device install app --device "$DEVICE" "$APP"
-  echo "installed on $DEVICE: copy prod.keys, base.nsp, upd4-0-1.nsp (dlc.nsp, Firmware/) into the app's Files folder"
+  echo "installed on $DEVICE: copy prod.keys, base.nsp, the update .nsp (dlc.nsp, Firmware/) into the app's Files folder"
 fi

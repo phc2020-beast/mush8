@@ -1,8 +1,10 @@
 // Mush8 - main.rs
 // Constantin Clerc (c22dev) - 0.1
+mod aspect;
 mod audio;
 mod diag;
 mod dnssd;
+mod game;
 mod gfx;
 mod guest;
 mod haptics;
@@ -12,13 +14,18 @@ mod ipc;
 mod kernel;
 mod loader;
 mod mem;
+mod mods;
+mod motion;
 mod movie;
 mod remote;
 mod services;
+#[cfg(target_os = "macos")]
+mod sdl;
 mod shm;
 mod stubs;
 mod nvn;
 mod svc;
+mod webpad;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -45,7 +52,15 @@ struct Npdm {
 fn read_npdm(path: &PathBuf) -> Result<Npdm> {
     let b = std::fs::read(path).with_context(|| path.display().to_string())?;
     anyhow::ensure!(b.len() >= 0x20 && &b[..4] == b"META", "not an NPDM");
+    anyhow::ensure!(b[0xC] & 1 != 0, "32-bit ARM (AArch32) code is not supported; Mush8 requires AArch64");
     Ok(Npdm { priority: b[0xE], core: b[0xF], stack_size: u32::from_le_bytes(b[0x1C..0x20].try_into()?) })
+}
+
+fn update_file(p: &std::path::Path) -> PathBuf {
+    if !p.exists() && p == std::path::Path::new("update.nsp") && std::path::Path::new("upd4-0-1.nsp").exists() {
+        return PathBuf::from("upd4-0-1.nsp");
+    }
+    p.to_path_buf()
 }
 
 fn program(n: &nxfs::Nsp) -> Result<&nxfs::nca::Nca> {
@@ -90,7 +105,7 @@ struct Args {
     keys: PathBuf,
     #[arg(long, default_value = "base.nsp")]
     base: PathBuf,
-    #[arg(long, default_value = "upd4-0-1.nsp")]
+    #[arg(long, default_value = "update.nsp")]
     update: PathBuf,
     #[arg(long, default_value = "work/save")]
     save: PathBuf,
@@ -102,16 +117,16 @@ struct Args {
     firmware: PathBuf,
     #[arg(long)]
     dlc: Vec<PathBuf>,
+    #[arg(long = "mod")]
+    mods: Vec<PathBuf>,
     #[arg(long)]
     precompile: bool,
-    #[arg(long)]
-    movies: bool,
 }
 
 #[cfg(target_os = "macos")]
 fn main() -> Result<()> {
     start(Args::parse())?;
-    gfx::run_app("Mush8", 1280.0, 720.0)
+    gfx::run_app("Mush8", 720.0 * aspect::ratio(), 720.0)
 }
 
 #[cfg(target_os = "ios")]
@@ -139,13 +154,14 @@ fn main() {
         unsafe { std::env::set_var(k, v) };
     }
     eprintln!("[host] iOS: files in {}, bundle {}", docs.display(), bundle.display());
-    let args = Args::parse_from(["nxhost", "--patched", &bundle.join("modules").display().to_string(), "--npdm", &bundle.join("modules/main.npdm").display().to_string()]);
+    let mut args = Args::parse_from(["nxhost", "--patched", &bundle.join("modules").display().to_string(), "--npdm", &bundle.join("modules/main.npdm").display().to_string()]);
     gfx::run_app(move || {
         apply_launcher_settings();
-        let missing: Vec<&str> = ["prod.keys", "base.nsp", "upd4-0-1.nsp"].into_iter().filter(|f| !std::path::Path::new(f).exists()).collect();
+        args.mods = ios_mods();
+        let missing: Vec<&str> = ["prod.keys", "base.nsp", "update.nsp"].into_iter().filter(|f| !update_file(std::path::Path::new(f)).exists()).collect();
         anyhow::ensure!(
             missing.is_empty(),
-            "Missing {}.\n\nCopy prod.keys, base.nsp, upd4-0-1.nsp (and optionally dlc.nsp and the Firmware folder) into this app's folder: Finder → your iPhone or iPad → Files → Mush8, or the Files app → On My iPhone → Mush8.",
+            "Missing {}.\n\nCopy prod.keys, base.nsp, the update .nsp (and optionally dlc.nsp and the Firmware folder) into this app's folder: Finder → your iPhone or iPad → Files → Mush8, or the Files app → On My iPhone → Mush8.",
             missing.join(", ")
         );
         start(args)
@@ -153,11 +169,25 @@ fn main() {
 }
 
 #[cfg(target_os = "ios")]
+fn ios_mods() -> Vec<PathBuf> {
+    use std::ffi::{CStr, c_char, c_void};
+    unsafe extern "C" {
+        fn mush8_each_mod(context: *mut c_void, callback: extern "C" fn(*mut c_void, *const c_char));
+    }
+    extern "C" fn collect(context: *mut c_void, path: *const c_char) {
+        let mods = unsafe { &mut *context.cast::<Vec<PathBuf>>() };
+        mods.push(PathBuf::from(unsafe { CStr::from_ptr(path) }.to_string_lossy().as_ref()));
+    }
+    let mut mods = Vec::new();
+    unsafe { mush8_each_mod((&mut mods as *mut Vec<PathBuf>).cast(), collect) };
+    mods
+}
+
+#[cfg(target_os = "ios")]
 fn apply_launcher_settings() {
     let config = std::fs::read_to_string("config.json").unwrap_or_default();
     let field = |key: &str| {
-        let rest = config.split(&format!("\"{key}\"")).nth(1)?;
-        let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+        let rest = config.split(&format!("\"{key}\"")).skip(1).find_map(|r| r.trim_start().strip_prefix(':'))?.trim_start();
         if let Some(rest) = rest.strip_prefix('"') {
             let mut out = String::new();
             let mut chars = rest.chars();
@@ -185,6 +215,9 @@ fn apply_launcher_settings() {
     if let Some(server) = field("lanplay_server").filter(|s| !s.is_empty()) {
         unsafe { std::env::set_var("NX_LANPLAY_SERVER", server) };
     }
+    if let Some(pid) = field("nextendo_pid").filter(|s| !s.is_empty() && s != "0") {
+        unsafe { std::env::set_var("NX_NEXTENDO_PID", pid) };
+    }
     if field("prewarm_pipelines").as_deref() != Some("false") {
         unsafe { std::env::set_var("NX_PREWARM", "1") };
     }
@@ -194,6 +227,15 @@ fn apply_launcher_settings() {
     if field("rumble").as_deref() == Some("false") {
         unsafe { std::env::set_var("NX_RUMBLE", "0") };
     }
+    if let Some(min) = field("rumble_min") {
+        unsafe { std::env::set_var("NX_RUMBLE_MIN", min) };
+    }
+    if field("gamepad_driver").as_deref() == Some("sdl") {
+        unsafe { std::env::set_var("NX_PAD_DRIVER", "sdl") };
+    }
+    if field("spatial_audio").as_deref() == Some("false") {
+        unsafe { std::env::set_var("NX_SPATIAL", "0") };
+    }
     if field("motion_controls").as_deref() == Some("true") {
         unsafe { std::env::set_var("NX_MOTION", "1") };
     }
@@ -202,6 +244,18 @@ fn apply_launcher_settings() {
     }
     if field("phone_pads").as_deref() == Some("true") {
         unsafe { std::env::set_var("NX_PHONE_PADS", "1") };
+        if field("browser_pads").as_deref() == Some("true") {
+            unsafe { std::env::set_var("NX_BROWSER_PADS", "1") };
+        }
+    }
+    if field("aspect").as_deref() != Some("16:9") {
+        unsafe { std::env::set_var("NX_ASPECT", "auto") };
+    }
+    if field("hud").as_deref() == Some("center") {
+        unsafe { std::env::set_var("NX_HUD", "center") };
+    }
+    if let Some(scale) = field("hud_scale") {
+        unsafe { std::env::set_var("NX_HUD_SCALE", scale) };
     }
 }
 
@@ -211,21 +265,19 @@ fn start(args: Args) -> Result<()> {
 
     let keys = nxfs::keys::Keys::load(&args.keys)?;
     let base = nxfs::Nsp::open(&args.base, &keys)?;
-    let update = nxfs::Nsp::open(&args.update, &keys)?;
-    let romfs = program(&update)?.patched_romfs(program(&base)?)?;
+    let update = nxfs::Nsp::open(&update_file(&args.update), &keys)?;
+    let version = game::identify(&update, &dir)?;
+    let romfs = mods::romfs(program(&update)?.patched_romfs(program(&base)?)?, &args.mods)?;
     eprintln!("[host] RomFS: {:.2} GB", nxfs::storage::Storage::size(&*romfs) as f64 / 1e9);
-    if args.movies {
-        movie::webm::convert_all(romfs)?;
-        std::process::exit(0);
-    }
     if args.precompile {
         let modules: Vec<PathBuf> = ["main", "subsdk0", "sdk"].iter().map(|m| dir.join(format!("{m}.bin"))).collect();
         nvn::precompile(romfs, &modules)?;
         std::process::exit(0);
     }
+    let romfs = aspect::romfs(romfs)?;
     let _ = services::fs::CONFIG.set(services::fs::Config {
         romfs,
-        save_dir: args.save.clone(),
+        save_dir: if args.save == std::path::Path::new("work/save") && version != "4.0.1" { PathBuf::from(format!("work/save-{version}")) } else { args.save.clone() },
         sd_dir: args.sdmc.clone(),
         system_dir: args.system.clone(),
         firmware_dir: args.firmware.clone(),
@@ -235,6 +287,9 @@ fn start(args: Args) -> Result<()> {
 
     if remote::enabled() {
         remote::host();
+        if webpad::enabled() {
+            webpad::host();
+        }
     }
     diag::install_handlers();
     guest::init_tsd();
@@ -272,6 +327,7 @@ fn start(args: Args) -> Result<()> {
     a.set(a.stack(), stack_size, mem::Block { state: mem::state::STACK, perm: mem::perm::RW, attr: 0 })?;
     let h = kernel::create_thread(start, 0, a.stack() + stack_size, npdm.priority as i32, npdm.core as i32)?;
     let t = kernel::thread(h).unwrap();
+    services::nextendo::log_start();
     eprintln!("[host] main thread {h:#x}: prio {} core {} stack {stack_size:#x}; entering nn::init::Start", npdm.priority, npdm.core);
     let main_base = mods[0].base;
     let j = kernel::start_thread(t, [h as u64, main_base, init_done as *const () as usize as u64, init_modules as *const () as usize as u64])?;

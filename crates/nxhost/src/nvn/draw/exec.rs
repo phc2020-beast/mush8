@@ -97,7 +97,7 @@ impl Replay<'_> {
             r.attr_stream[i] = stream as u32;
         }
         for s in 0..16 {
-            r.vb[s] = if st.vbufs[s].0 != 0 { self.gpu(st.vbufs[s].0, false) } else { gfx::gpu().zeros.0.gpuAddress() };
+            r.vb[s] = if st.vbufs[s].0 != 0 { self.gpu_range(st.vbufs[s].0, st.vbufs[s].1, false) } else { gfx::gpu().zeros.0.gpuAddress() };
             r.vb_stride[s] = st.streams[s].0;
             r.vb_divisor[s] = st.streams[s].1;
         }
@@ -106,9 +106,11 @@ impl Replay<'_> {
         let heap = self.heap;
         let pass = self.pass.as_mut().unwrap();
         if let Some(hb) = heap {
-            if pass.heap != hb.gpu {
-                pass.enc.useResource_usage_stages(ProtocolObject::from_ref(&*hb.buffer.0), MTLResourceUsage::Read, MTLRenderStages::Vertex | MTLRenderStages::Fragment);
-                pass.heap = hb.gpu;
+            if pass.heap != hb.chunks[0].gpu {
+                for chunk in &hb.chunks {
+                    pass.enc.useResource_usage_stages(ProtocolObject::from_ref(&*chunk.buffer.0), MTLResourceUsage::Read, MTLRenderStages::Vertex | MTLRenderStages::Fragment);
+                }
+                pass.heap = hb.chunks[0].gpu;
             }
         }
 
@@ -193,10 +195,15 @@ impl Replay<'_> {
                 let swz = tb.map(|b| [0x38usize, 0x3c, 0x40, 0x44].map(|o| u32::from_le_bytes(b[o..o + 4].try_into().unwrap())));
                 eprintln!("[frame]   tex {}{b}: id {tid} pool {:#x} -> {:?} swizzle {swz:?}", ["v", "f", "c"][stage], st.texture_pool, got.as_ref().map(|(k, _, _)| (k.addr, k.format, k.width, k.height)));
             }
-            let tex = got
-                .and_then(|(k, t, tb)| self.e.textures.view(k, &tb, &t, kind))
-                .filter(|t| !kind.is_depth() || gfx_is_depth(t.0.pixelFormat()))
-                .unwrap_or_else(|| self.e.textures.dummy(kind));
+            let tex = match got {
+                Some((k, t, tb)) => self
+                    .e
+                    .textures
+                    .view(k, &tb, &t, kind)
+                    .filter(|t| !kind.is_depth() || gfx_is_depth(t.0.pixelFormat()))
+                    .unwrap_or_else(|| self.e.textures.fallback(kind, &t)),
+                None => self.e.textures.dummy(kind),
+            };
             let sampler = self.e.textures.sampler(sb.as_ref());
             let slot = c.iface.samplers.get(&b).copied().unwrap_or(0);
             bound.push((b, tex, slot, sampler));
@@ -230,7 +237,9 @@ impl Replay<'_> {
         let Some(enc) = self.cb.computeCommandEncoder() else { return Err("no compute encoder") };
         enc.setComputePipelineState(&pipeline.0);
         if let Some(h) = self.heap {
-            enc.useResource_usage(ProtocolObject::from_ref(&*h.buffer.0), MTLResourceUsage::Read | MTLResourceUsage::Write);
+            for chunk in &h.chunks {
+                enc.useResource_usage(ProtocolObject::from_ref(&*chunk.buffer.0), MTLResourceUsage::Read | MTLResourceUsage::Write);
+            }
         }
         for b in &self.e.arena.used {
             enc.useResource_usage(ProtocolObject::from_ref(&*b.0), MTLResourceUsage::Read);
@@ -265,12 +274,13 @@ impl Replay<'_> {
             alpha_ref: 0.0,
             alpha_func: 7,
             heap_base: 0,
-            heap_gpu: 0,
+            heap_gpu: [0; gfx::MAX_HEAP_CHUNKS],
             heap_size: 0,
+            heap_chunk_size: 0,
             zero_gpu: zeros,
         };
         if let Some(h) = self.heap {
-            (r.heap_base, r.heap_gpu, r.heap_size) = (h.base, h.gpu, h.size);
+            (r.heap_base, r.heap_gpu, r.heap_size, r.heap_chunk_size) = (h.base, h.gpu_addresses(), h.size, h.chunk_size);
         }
         if st.storage[stage].iter().any(|s| s.0 != 0) {
             let mut bank0 = [0u32; 0x100];
@@ -286,7 +296,7 @@ impl Replay<'_> {
                 self.use_chunk(&a.buffer);
             }
         }
-        r.cb[1] = self.gpu(constants, false);
+        r.cb[1] = self.gpu_range(constants, 0x10000, false);
         let handles = st.textures[stage];
         if self.e.bank_ok[stage] && self.e.bank_tex[stage] == handles {
             r.cb[2] = self.e.bank_gpu[stage];
@@ -305,15 +315,16 @@ impl Replay<'_> {
             self.e.bank_gpu[stage] = a.gpu;
             self.e.bank_ok[stage] = true;
         }
-        for (i, &(addr, _)) in st.ubos[stage].iter().enumerate() {
+        for (i, &(addr, size)) in st.ubos[stage].iter().enumerate() {
             if addr != 0 {
-                r.cb[3 + i] = self.gpu(addr, true);
+                r.cb[3 + i] = self.gpu_range(addr, size, true);
             }
         }
         r
     }
 
     fn primitives(&mut self, d: &super::Draw) -> Result<Prim, &'static str> {
+        d.validate_indices()?;
         let (ty, convert): (MTLPrimitiveType, Option<fn(&[u32]) -> Vec<u32>>) = match d.mode {
             0 => (MTLPrimitiveType::Point, None),
             1 => (MTLPrimitiveType::Line, None),
@@ -358,11 +369,17 @@ impl Replay<'_> {
             (Some((t, addr)), conv) => {
                 let size = index_size(t);
                 let heap = self.heap;
-                let in_heap = heap.is_some_and(|h| h.gpu_addr(addr).is_some() && h.gpu_addr(addr + size * d.count as u64 - 1).is_some());
-                if conv.is_none() && t != 0 && in_heap && addr % size == 0 {
-                    let h = heap.unwrap();
+                let range = heap.and_then(|h| h.buffer_range(addr, size * d.count as u64));
+                if let Some((chunk, off)) = range.filter(|_| conv.is_none() && t != 0 && addr % size == 0) {
                     let itype = if t == 1 { MTLIndexType::UInt16 } else { MTLIndexType::UInt32 };
-                    return Ok(Prim::Indexed { ty, itype, buffer: h.buffer.clone(), offset: (addr - h.base) as usize, count: d.count as usize, base_vertex: d.base_vertex });
+                    return Ok(Prim::Indexed { ty, itype, buffer: chunk.buffer.clone(), offset: off, count: d.count as usize, base_vertex: d.base_vertex });
+                }
+                if !crate::kernel::aspace().readable(addr, size * d.count as u64) {
+                    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        eprintln!("[gfx] draw skipped: its {} indices at {addr:#x} are outside guest memory", d.count);
+                    }
+                    return Err("index buffer outside guest memory");
                 }
                 let src = read_indices(t, addr, d.count);
                 let v = match conv {
