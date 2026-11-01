@@ -9,7 +9,7 @@ use objc2_core_video::*;
 use objc2_foundation::{NSDictionary, NSNumber, NSString, NSURL};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, channel, sync_channel};
 use std::sync::{LazyLock, Mutex};
 
 static SEEKS: LazyLock<Mutex<HashMap<u64, i64>>> = LazyLock::new(Default::default);
@@ -51,7 +51,23 @@ impl FrameSource {
                 None => return false,
             }
         }
-        let Ok(mut frame) = self.worker.frames.recv() else { return false };
+        let mut frame = match self.worker.frames.recv_timeout(std::time::Duration::from_millis(250)) {
+            Ok(f) => f,
+            Err(RecvTimeoutError::Disconnected) => return false,
+            Err(RecvTimeoutError::Timeout) => {
+                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("[movie] video decoder is late: showing the previous frame");
+                }
+                let (stride, rows) = self.layout;
+                if out.len() != stride * rows * 3 / 2 {
+                    out.clear();
+                    out.resize(stride * rows * 3 / 2, 0);
+                    out[stride * rows..].fill(128);
+                }
+                return true;
+            }
+        };
         std::mem::swap(out, &mut frame);
         let _ = self.worker.recycle.send(frame);
         true
@@ -78,25 +94,56 @@ fn spawn(source: Source, us: i64, stride: usize, rows: usize) -> Option<Worker> 
             }
         })
         .ok()?;
-    ready.recv().ok()?.then_some(Worker { frames, recycle })
+    ready.recv_timeout(std::time::Duration::from_secs(5)).ok()?.then_some(Worker { frames, recycle })
 }
 
 fn run_webm(movie: &super::webm::Movie, us: i64, tx: &SyncSender<Vec<u8>>, spare: &Receiver<Vec<u8>>, stride: usize, rows: usize) {
     let size = stride * rows * 3 / 2;
     let start = movie.frames.iter().position(|f| f.us >= us).unwrap_or(movie.frames.len());
     let key = movie.frames[..=start.min(movie.frames.len() - 1)].iter().rposition(|f| f.key).unwrap_or(0);
+    let Some(mut dec) = vpx::Vp8::new() else {
+        eprintln!("[movie] VP8 decoder failed to start");
+        return;
+    };
     let mut last = vec![0u8; size];
     last[stride * rows..].fill(128);
-    movie.keyframe_nv12(key, &mut last, stride, rows);
-    for i in start..movie.frames.len() {
-        if i != key && movie.frames[i].key {
-            movie.keyframe_nv12(i, &mut last, stride, rows);
+    let mut warned = false;
+    for (i, f) in movie.frames.iter().enumerate().skip(key) {
+        match dec.decode(&movie.data[f.range.clone()]) {
+            Ok(Some(img)) => nv12(&img, &mut last, stride, rows),
+            Ok(None) => {}
+            Err(e) if !warned => {
+                warned = true;
+                eprintln!("[movie] VP8 frame {i}: decode error {e}");
+            }
+            Err(_) => {}
+        }
+        if i < start {
+            continue;
         }
         let mut out = spare.try_recv().unwrap_or_default();
         out.clear();
         out.extend_from_slice(&last);
         if tx.send(out).is_err() {
             return;
+        }
+    }
+}
+
+fn nv12(img: &vpx::Image, out: &mut [u8], stride: usize, rows: usize) {
+    let (w, h) = (img.width.min(stride), img.height.min(rows));
+    let [y, u, v] = img.planes;
+    let [ys, us, vs] = img.strides;
+    for r in 0..h {
+        out[r * stride..r * stride + w].copy_from_slice(&y[r * ys..r * ys + w]);
+    }
+    let uv = stride * rows;
+    let (cw, ch) = (img.width.div_ceil(2).min(stride / 2), img.height.div_ceil(2).min(rows / 2));
+    for r in 0..ch {
+        let (u, v, o) = (&u[r * us..r * us + cw], &v[r * vs..r * vs + cw], &mut out[uv + r * stride..uv + r * stride + cw * 2]);
+        for x in 0..cw {
+            o[2 * x] = u[x];
+            o[2 * x + 1] = v[x];
         }
     }
 }

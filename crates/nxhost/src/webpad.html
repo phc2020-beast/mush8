@@ -1,0 +1,254 @@
+<!-- Mush8 - webpad.html -->
+<!-- Constantin Clerc (c22dev) - 0.1 -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Mush8 Pad">
+<title>Mush8 Pad</title>
+<style>
+  :root { --bg: #121212; --btn: #2b2b2b; --edge: #454545; --text: #e8e8e8; --on: #e60012; --on-edge: #ff5a66; }
+  html, body {
+    margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font-family: -apple-system, system-ui, sans-serif; overflow: hidden;
+    touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  }
+  #status {
+    position: fixed; top: 17vmin; left: 50%; transform: translateX(-50%);
+    font-size: 13px; padding: 4px 12px; border-radius: 12px; background: #1f1f1f; white-space: nowrap;
+  }
+  #status.ok { background: #14361f; color: #8fe0a8; }
+  .btn {
+    position: fixed; display: flex; align-items: center; justify-content: center; box-sizing: border-box;
+    width: 15vmin; height: 15vmin; border-radius: 50%; transform: translate(-50%, -50%);
+    background: var(--btn); border: 2px solid var(--edge); font-size: 6vmin; font-weight: 700; color: var(--text);
+  }
+  .btn.on { background: var(--on); border-color: var(--on-edge); color: #fff; }
+  .shoulder { width: 35vmin; border-radius: 7.5vmin; }
+  .small { width: 10vmin; height: 10vmin; font-size: 5.5vmin; }
+  #L { left: calc(env(safe-area-inset-left) + 26vmin); top: 12vmin; }
+  #R { left: calc(100vw - env(safe-area-inset-right) - 26vmin); top: 12vmin; }
+  #MINUS { left: calc(50vw - 12vmin); top: 9vmin; }
+  #PLUS  { left: calc(50vw + 12vmin); top: 9vmin; }
+  #A { left: calc(100vw - env(safe-area-inset-right) - 16.5vmin); top: calc(100vh - 32vmin); }
+  #Y { left: calc(100vw - env(safe-area-inset-right) - 43.5vmin); top: calc(100vh - 32vmin); }
+  #X { left: calc(100vw - env(safe-area-inset-right) - 30vmin); top: calc(100vh - 45.5vmin); }
+  #B { left: calc(100vw - env(safe-area-inset-right) - 30vmin); top: calc(100vh - 18.5vmin); }
+  #base {
+    position: fixed; width: 32vmin; height: 32vmin; border-radius: 50%; transform: translate(-50%, -50%);
+    border: 2px solid var(--edge); background: #1b1b1b; pointer-events: none; box-sizing: border-box;
+  }
+  #knob {
+    position: absolute; left: 50%; top: 50%; width: 14vmin; height: 14vmin; border-radius: 50%;
+    margin: -7vmin 0 0 -7vmin; background: #3a3a3a; border: 2px solid #5a5a5a; box-sizing: border-box;
+  }
+  #hint { position: fixed; bottom: calc(env(safe-area-inset-bottom) + 6px); left: 50%; transform: translateX(-50%); font-size: 11px; opacity: .45; white-space: nowrap; }
+  #rotate {
+    display: none; position: fixed; inset: 0; z-index: 10; background: var(--bg);
+    align-items: center; justify-content: center; text-align: center; font-size: 20px; padding: 24px;
+  }
+  @media (orientation: portrait) { #rotate { display: flex; } }
+  #keys { display: none; }
+  body.desktop .btn, body.desktop #base, body.desktop #hint, body.desktop #rotate { display: none; }
+  body.desktop #status { top: 24px; }
+  body.desktop #keys {
+    display: grid; grid-template-columns: auto auto; gap: 10px 28px; align-items: center;
+    position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); font-size: 15px;
+  }
+  #keys .name { color: #aaa; text-align: right; }
+  #keys .row { display: flex; gap: 6px; }
+  #keys kbd {
+    min-width: 28px; padding: 5px 9px; border-radius: 7px; text-align: center; font: 600 14px -apple-system, system-ui, sans-serif;
+    background: var(--btn); border: 2px solid var(--edge); color: var(--text);
+  }
+  #keys kbd.on { background: var(--on); border-color: var(--on-edge); color: #fff; }
+</style>
+</head>
+<body>
+<div id="status" data-t="connecting">Connecting…</div>
+<div id="base"><div id="knob"></div></div>
+<div class="btn shoulder" id="L" data-b="L">L</div>
+<div class="btn shoulder" id="R" data-b="R">R</div>
+<div class="btn small" id="MINUS" data-b="MINUS">−</div>
+<div class="btn small" id="PLUS" data-b="PLUS">+</div>
+<div class="btn" id="X" data-b="X">X</div>
+<div class="btn" id="Y" data-b="Y">Y</div>
+<div class="btn" id="A" data-b="A">A</div>
+<div class="btn" id="B" data-b="B">B</div>
+<div id="hint" data-t="hint">Left side: stick · A accelerate · B brake · L item · R drift</div>
+<div id="keys"></div>
+<div id="rotate" data-t="rotate">Turn your phone sideways 🔄</div>
+<script>
+const T = {
+  en: {
+    connecting: 'Connecting…',
+    hint: 'Left side: stick · A accelerate · B brake · L item · R drift', rotate: 'Turn your phone sideways 🔄',
+    waiting: 'Waiting for Mush8…', player: 'Player ', full: 'No free player slot', lost: 'Disconnected, reconnecting…',
+    stale: 'Waiting for Mush8… (is the game running?)', stick: 'Left stick', dpad: 'D-pad',
+  },
+  de: {
+    connecting: 'Verbinde …',
+    hint: 'Linke Seite: Stick · A Gas · B Bremse · L Item · R Drift', rotate: 'Bitte das Handy quer halten 🔄',
+    waiting: 'Warte auf Mush8 …', player: 'Spieler ', full: 'Kein freier Spieler-Platz', lost: 'Getrennt, verbinde neu …',
+    stale: 'Warte auf Mush8 … (läuft das Spiel?)', stick: 'Linker Stick', dpad: 'Steuerkreuz',
+  },
+};
+const lang = (navigator.language || 'en').toLowerCase().startsWith('de') ? 'de' : 'en';
+const t = T[lang];
+document.documentElement.lang = lang;
+for (const el of document.querySelectorAll('[data-t]')) el.textContent = t[el.dataset.t];
+const BITS = { A: 1, B: 2, X: 4, Y: 8, L: 64, R: 128, ZL: 256, ZR: 512, PLUS: 1024, MINUS: 2048 };
+const KEYS = { KeyX: 1, Enter: 1, KeyZ: 2, Backspace: 2, KeyC: 4, KeyV: 8, KeyQ: 64, KeyE: 128, Digit1: 256, Digit3: 512, Equal: 1024, Tab: 1024, Minus: 2048, ArrowLeft: 4096, ArrowUp: 8192, ArrowRight: 16384, ArrowDown: 32768 };
+const STICK_KEYS = ['KeyW', 'KeyA', 'KeyS', 'KeyD'];
+const REACH = 2.5;
+const keys = new Set();
+const LEGEND = [
+  ['stick', [['KeyW', 'W'], ['KeyA', 'A'], ['KeyS', 'S'], ['KeyD', 'D']]],
+  ['A', [['KeyX', 'X'], ['Enter', 'Enter']]],
+  ['B', [['KeyZ', 'Z'], ['Backspace', '⌫']]],
+  ['X', [['KeyC', 'C']]],
+  ['Y', [['KeyV', 'V']]],
+  ['L / R', [['KeyQ', 'Q'], ['KeyE', 'E']]],
+  ['ZL / ZR', [['Digit1', '1'], ['Digit3', '3']]],
+  ['+ / −', [['Equal', '='], ['Tab', 'Tab'], ['Minus', '-']]],
+  ['dpad', [['ArrowLeft', '←'], ['ArrowUp', '↑'], ['ArrowRight', '→'], ['ArrowDown', '↓']]],
+];
+const desktop = matchMedia('(hover: hover) and (pointer: fine)').matches && !navigator.maxTouchPoints;
+if (desktop) {
+  document.body.classList.add('desktop');
+  const box = document.getElementById('keys');
+  for (const [name, list] of LEGEND) {
+    const label = document.createElement('div');
+    label.className = 'name';
+    label.textContent = t[name] || name;
+    const row = document.createElement('div');
+    row.className = 'row';
+    for (const [code, cap] of list) {
+      const k = document.createElement('kbd');
+      k.dataset.code = code;
+      k.textContent = cap;
+      row.appendChild(k);
+    }
+    box.append(label, row);
+  }
+}
+const base = document.getElementById('base'), knob = document.getElementById('knob'), statusEl = document.getElementById('status');
+const held = new Map();
+let stickId = null, origin = null, lx = 0, ly = 0, buttons = 0, sent = '', lastAck = 0, player = null, ws = null;
+
+const unit = () => Math.min(innerWidth, innerHeight) / 10;
+const radius = () => 1.6 * unit();
+function home() {
+  const left = parseFloat(getComputedStyle(document.getElementById('L')).left) - 2.6 * unit();
+  return { x: left + 3.2 * unit(), y: innerHeight - 3.2 * unit() };
+}
+function placeBase(p) {
+  base.style.left = p.x + 'px';
+  base.style.top = p.y + 'px';
+}
+function restStick() {
+  placeBase(home());
+  knob.style.transform = '';
+}
+function bitAt(x, y) {
+  const el = document.elementFromPoint(x, y);
+  const b = el && el.closest('.btn');
+  return b ? BITS[b.dataset.b] : 0;
+}
+function moveStick(t) {
+  const r = radius();
+  let dx = t.clientX - origin.x, dy = t.clientY - origin.y;
+  const d = Math.hypot(dx, dy);
+  if (d > r) { dx *= r / d; dy *= r / d; }
+  knob.style.transform = `translate(${dx}px, ${dy}px)`;
+  lx = dx / r; ly = -dy / r;
+}
+const onUi = (e) => e.target.closest && e.target.closest('.ui');
+function start(e) {
+  if (onUi(e)) return;
+  e.preventDefault();
+  const h = home();
+  for (const t of e.changedTouches) {
+    const bit = bitAt(t.clientX, t.clientY);
+    if (!bit && stickId === null && Math.hypot(t.clientX - h.x, t.clientY - h.y) < REACH * radius()) {
+      stickId = t.identifier;
+      origin = { x: t.clientX, y: t.clientY };
+      placeBase(origin);
+      moveStick(t);
+    } else if (bit) {
+      held.set(t.identifier, bit);
+    }
+  }
+  update();
+}
+function move(e) {
+  if (onUi(e)) return;
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    if (t.identifier === stickId) moveStick(t);
+    else if (held.has(t.identifier)) held.set(t.identifier, bitAt(t.clientX, t.clientY));
+  }
+  update();
+}
+function end(e) {
+  if (onUi(e)) return;
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    if (t.identifier === stickId) { stickId = null; lx = ly = 0; restStick(); }
+    held.delete(t.identifier);
+  }
+  update();
+}
+function update() {
+  const before = buttons;
+  buttons = 0;
+  for (const b of held.values()) buttons |= b;
+  for (const k of keys) buttons |= KEYS[k] || 0;
+  if (buttons & ~before && navigator.vibrate) navigator.vibrate(8);
+  for (const el of document.querySelectorAll('.btn')) el.classList.toggle('on', !!(buttons & BITS[el.dataset.b]));
+  for (const el of document.querySelectorAll('#keys kbd')) el.classList.toggle('on', keys.has(el.dataset.code));
+  send(false);
+}
+function send(force) {
+  const s = buttons + ',' + lx.toFixed(3) + ',' + ly.toFixed(3);
+  if ((force || s !== sent) && ws && ws.readyState === 1) { ws.send(s); sent = s; }
+}
+function setStatus(text, ok) { statusEl.textContent = text; statusEl.classList.toggle('ok', !!ok); }
+function connect() {
+  ws = new WebSocket('ws://' + location.host + '/ws');
+  ws.onopen = () => { setStatus(t.waiting); send(true); };
+  ws.onmessage = (m) => {
+    lastAck = Date.now();
+    const p = parseInt(m.data.split(' ')[1], 10);
+    if (p !== player) { player = p; setStatus(p ? t.player + p : t.full, p > 0); }
+  };
+  ws.onclose = () => { player = null; setStatus(t.lost); setTimeout(connect, 1000); };
+}
+setInterval(() => {
+  send(true);
+  if (player !== null && Date.now() - lastAck > 2000) { player = null; setStatus(t.stale); }
+}, 50);
+for (const [type, fn] of [['touchstart', start], ['touchmove', move], ['touchend', end], ['touchcancel', end]]) {
+  document.addEventListener(type, fn, { passive: false });
+}
+function onKey(e, down) {
+  if (!(e.code in KEYS) && !STICK_KEYS.includes(e.code)) return;
+  e.preventDefault();
+  if (down) keys.add(e.code); else keys.delete(e.code);
+  if (stickId === null) { lx = keys.has('KeyD') - keys.has('KeyA'); ly = keys.has('KeyW') - keys.has('KeyS'); }
+  update();
+}
+addEventListener('keydown', (e) => onKey(e, true));
+addEventListener('keyup', (e) => onKey(e, false));
+addEventListener('blur', () => { keys.clear(); if (stickId === null) lx = ly = 0; update(); });
+addEventListener('resize', () => { if (stickId === null) restStick(); });
+restStick();
+update();
+connect();
+</script>
+</body>
+</html>
